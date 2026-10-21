@@ -1,0 +1,80 @@
+services:
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: meeting
+      MYSQL_USER: meeting
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?set MYSQL_PASSWORD}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?set MYSQL_ROOT_PASSWORD}
+    volumes: ["mysql-data:/var/lib/mysql"]
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+  api:
+    build: .
+    environment:
+      NODE_ENV: production
+      PORT: 33101
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+      DATABASE_URL: mysql://meeting:${MYSQL_PASSWORD}@mysql:3306/meeting
+      APP_ORIGIN: ${APP_ORIGIN:?set HTTPS origin}
+      SFU_URL: http://sfu:3002
+      INTERNAL_SECRET: ${INTERNAL_SECRET:?set INTERNAL_SECRET}
+      TURN_URLS: ${TURN_URLS:?set public TURN URLs}
+      STUN_URLS: ${STUN_URLS:?set public STUN URLs}
+      TURN_SECRET: ${TURN_SECRET:?set TURN_SECRET}
+      ADMIN_PHONE: ${ADMIN_PHONE:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    depends_on:
+      mysql: { condition: service_healthy }
+      sfu: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:33101/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+    restart: unless-stopped
+  signaling:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./deploy/nginx/meeting.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./deploy/certs:/etc/nginx/certs:ro
+    ports: ["443:443"]
+    depends_on:
+      api: { condition: service_healthy }
+    restart: unless-stopped
+  sfu:
+    build: .
+    command: ["node", "server/sfu-server.mjs"]
+    environment:
+      SFU_PORT: 3002
+      INTERNAL_SECRET: ${INTERNAL_SECRET:?set INTERNAL_SECRET}
+      RTC_ANNOUNCED_IP: ${RTC_ANNOUNCED_IP:?set public server IP}
+      RTC_LISTEN_IP: 0.0.0.0
+      RTC_MIN_PORT: 40000
+      RTC_MAX_PORT: 40100
+      ROOM_MAX_MEDIA_STREAMS: 25
+      PEER_MAX_INCOMING_BITRATE: 6000000
+      PEER_MAX_OUTGOING_BITRATE: 8000000
+    ports:
+      - "40000-40100:40000-40100/udp"
+      - "40000-40100:40000-40100/tcp"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3002/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+  coturn:
+    image: coturn/coturn:4.6
+    command: ["-n", "--log-file=stdout", "--realm=${TURN_REALM:-meeting}", "--use-auth-secret", "--static-auth-secret=${TURN_SECRET:?set TURN_SECRET}", "--external-ip=${RTC_ANNOUNCED_IP:?set public server IP}", "--min-port=49160", "--max-port=49200", "--fingerprint", "--no-cli", "--no-tls", "--no-dtls", "--no-multicast-peers", "--no-loopback-peers", "--denied-peer-ip=169.254.0.0-169.254.255.255"]
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "49160-49200:49160-49200/udp"
+    restart: unless-stopped
+volumes:
+  mysql-data:

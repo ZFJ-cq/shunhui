@@ -1,0 +1,10 @@
+node_modules
+dist
+data
+backend
+.env
+.env.*
+!.env.example
+.git
+*.sqlite*
+deploy/certs
