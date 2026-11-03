@@ -33,8 +33,15 @@ test('REST authentication, meeting isolation, moderator controls, and both signa
   const hostJoin = await api(`/meetings/${meeting.meetingId}/join`, 'POST', { userId: host.userId, nickname: host.userId.toString() }, host.token)
   const guestJoin = await api(`/meetings/${meeting.meetingId}/join`, 'POST', { userId: guest.userId, nickname: 'guest' }, guest.token)
   const unrelatedJoin = await api(`/meetings/${otherMeeting.meetingId}/join`, 'POST', { userId: unrelated.userId, nickname: 'unrelated' }, unrelated.token)
+  assert.ok(Array.isArray(hostJoin.iceServers))
+  assert.ok(Array.isArray(guestJoin.iceServers))
   const [hostSocket, guestSocket, otherSocket] = await Promise.all([socket(hostJoin), socket(guestJoin), socket(unrelatedJoin)])
   try {
+    const iceReport = await new Promise((resolve) => hostSocket.emit('message', { type: 'ice_report', target: 'all', payload: { event: 'success', direction: 'send', transportId: 'test-transport' } }, resolve))
+    assert.equal(iceReport.code, 0)
+    const invalidIceReport = await new Promise((resolve) => hostSocket.emit('message', { type: 'ice_report', target: 'all', payload: { event: 'turn_relay', direction: 'send', transportId: 'test-transport', localCandidateType: 'host' } }, resolve))
+    assert.equal(invalidIceReport.code, 400)
+
     const direct = waitMessage(guestSocket, (m) => m.type === 'offer')
     const ack = await new Promise((resolve) => hostSocket.emit('message', { type: 'offer', from: host.userId, target: guest.userId, payload: { sdp: 'offer-sdp' } }, resolve))
     assert.equal(ack.code, 0)

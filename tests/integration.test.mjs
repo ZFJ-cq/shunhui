@@ -4,13 +4,20 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { io } from 'socket.io-client';
+import { DatabaseSync } from 'node:sqlite';
 import { startServer } from '../server/index.mjs';
 
 test('authenticated meeting lifecycle and isolated signaling', async () => {
+ const previousDbFile=process.env.DB_FILE;
  const dir = await mkdtemp(join(tmpdir(), 'shunhui-test-')); process.env.DB_FILE = join(dir, 'db.sqlite');
  const fakeSfu = { request: async (_id,_uid,method,data) => method==='capabilities'?{codecs:[{mimeType:'audio/opus'}]}:method==='createTransport'?{id:'test-transport',iceCandidates:[{ip:data.announcedIp || '127.0.0.1'}]}:{}, leave: async()=>{}, pause:async()=>{},resume:async()=>{},close:()=>{} };
  const oldAdminPhone=process.env.ADMIN_PHONE, oldAdminPassword=process.env.ADMIN_PASSWORD, oldAnnouncedIp=process.env.RTC_ANNOUNCED_IP;
+ const turnEnvKeys=['TURN_ENABLED','TURN_TTL_SECONDS','TURN_URLS','TURN_TCP_URL','TURN_SECRET','STUN_URLS','ICE_SERVERS'];
+ const oldTurnEnv=Object.fromEntries(turnEnvKeys.map(key=>[key,process.env[key]]));
  process.env.ADMIN_PHONE='13800138000'; process.env.ADMIN_PASSWORD='test-admin-password-123'; process.env.RTC_ANNOUNCED_IP='192.168.110.217';
+ process.env.TURN_ENABLED='true'; process.env.TURN_TTL_SECONDS='3600'; process.env.TURN_URLS='turn:turn.example.com:3478?transport=udp';
+ process.env.TURN_TCP_URL='turn:turn.example.com:3478?transport=tcp'; process.env.TURN_SECRET='test-turn-secret-with-at-least-32-characters'; process.env.STUN_URLS='stun:stun.example.com:3478';
+ process.env.ICE_SERVERS='[]';
  const server = await startServer(0, process.env.REAL_SFU === '1' ? {} : { sfu: fakeSfu }), base = `http://127.0.0.1:${server.port}`; const sockets = [];
  const call = async (path, token, method = 'GET', body) => {
   const res = await fetch(base + '/api' + path, { method, headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token || ''}` }, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -36,6 +43,9 @@ test('authenticated meeting lifecycle and isolated signaling', async () => {
   assert.equal((await call('/user/login','', 'POST',{phone:'13911111111',password:'test-user-password-123'})).status,401);
   const snake=(await call('/meetings/schedule',a.token,'POST',{meeting_title:'字段兼容预约',start_time:new Date(Date.now()+3600000).toISOString(),duration:60,max_participants:10,default_mute:true,join_before_host:true})).data;
   assert.equal(snake.title,'字段兼容预约'); assert.equal(snake.maxParticipants,10);
+  assert.equal((await call('/meetings/create',a.token,'POST',{title:'超出服务容量',maxParticipants:26})).status,400);
+  const farFuture=(await call('/meetings/schedule',a.token,'POST',{title:'远期预约',startTime:new Date(Date.now()+45*86400000).toISOString(),duration:60,inviteDays:1,maxParticipants:25})).data;
+  assert.ok(Date.parse(farFuture.inviteExpiresAt)>=Date.parse(farFuture.startTime)+60*60000);
   assert.equal((await call(`/meetings/${snake.id}`,a.token,'DELETE')).status,200);
   const adminManaged=(await call('/meetings/create',a.token,'POST',{title:'管理员操作测试'})).data;
   assert.equal((await call(`/admin/meetings/${adminManaged.id}/end`,adminLogin.data.token,'PUT')).status,200);
@@ -43,10 +53,24 @@ test('authenticated meeting lifecycle and isolated signaling', async () => {
   const m=(await call('/meetings/create',a.token,'POST',{title:'集成测试',password:'123456',maxParticipants:2})).data;
   assert.equal(m.hasPassword,true); assert.equal(m.passwordHash,undefined);
   assert.equal((await call(`/meetings/${m.id}/join`,b.token,'POST',{nickname:'参与者',password:'000000'})).status,403);
+  const hostJoinStartedAt=Math.floor(Date.now()/1000);
   const ja=(await call(`/meetings/${m.id}/join`,a.token,'POST',{nickname:'主持人'})).data;
+  const hostJoinFinishedAt=Math.floor(Date.now()/1000);
   const jb=(await call(`/meetings/${m.id}/join`,b.token,'POST',{nickname:'参与者',password:'123456'})).data;
+  assert.deepEqual(ja.iceServers[0],{urls:'stun:stun.example.com:3478'});
+  const turnServer=ja.iceServers.find(server=>server.username);
+  assert.deepEqual(turnServer.urls,['turn:turn.example.com:3478?transport=udp','turn:turn.example.com:3478?transport=tcp']);
+  const [turnExpiry,turnRandomId]=turnServer.username.split(':');
+  assert.match(turnRandomId,/^[a-f0-9]{32}$/);
+  const remainingTurnSeconds=Number(turnExpiry)-Math.floor(Date.now()/1000);
+  assert.ok(remainingTurnSeconds<=3600&&remainingTurnSeconds>=3600-(hostJoinFinishedAt-hostJoinStartedAt),`unexpected TURN expiry: ${remainingTurnSeconds}`);
+  assert.match(turnServer.credential,/^[A-Za-z0-9+/]{27}=$/);
   assert.equal((await call(`/meetings/${m.id}/join`,c.token,'POST',{nickname:'旁观者',password:'123456'})).status,409);
-  let sa=await connect(ja.token); const sb=await connect(jb.token);
+  let sa=await connect(ja.token), sb=await connect(jb.token);
+  assert.deepEqual((await request(sa,'ice_report',{event:'success',direction:'send',transportId:'test-transport'})).data,{});
+  assert.deepEqual((await request(sa,'ice_report',{event:'stun_ok',direction:'recv',transportId:'test-transport',localCandidateType:'srflx',remoteCandidateType:'host'})).data,{});
+  assert.ok((await request(sa,'ice_report',{event:'turn_relay',direction:'send',transportId:'test-transport',localCandidateType:'host'})).error);
+  assert.ok((await request(sa,'ice_report',{event:'unknown',direction:'send',transportId:'test-transport'})).error);
   assert.equal((await call(`/meetings/${m.id}/lock`,b.token,'PUT',{locked:true})).status,403);
   assert.equal((await call(`/meetings/${m.id}/chat`,b.token,'PUT',{chatClosed:true})).status,403);
   assert.equal((await call(`/meetings/${m.id}/participant/mute`,b.token,'PUT',{targetUserId:a.userId,media:'audio',mute:true})).status,403);
@@ -100,6 +124,7 @@ test('authenticated meeting lifecycle and isolated signaling', async () => {
   const reopenedMessage=nextSignal(sa,'chat_message');
   assert.equal((await request(sb,'chat',{content:'重新开放后可发送'})).error,undefined);
   assert.equal((await reopenedMessage).text,'重新开放后可发送');
+  assert.equal((await call(`/meetings/${m.id}/lock`,a.token,'PUT',{locked:false})).status,200);
   assert.equal((await call(`/meetings/${m.id}/participant/mute`,a.token,'PUT',{targetUserId:b.userId,media:'audio',mute:true})).status,200);
   let participants=(await call(`/meetings/${m.id}/participants`,a.token)).data;
   assert.equal(participants.find(p=>p.userId===b.userId).audioOff,true);
@@ -113,8 +138,99 @@ test('authenticated meeting lifecycle and isolated signaling', async () => {
   assert.equal(participants.find(p=>p.userId===a.userId).audioOff,hostAudioBeforeAllMute);
   assert.equal((await call(`/meetings/${m.id}/participant/${b.userId}`,a.token,'DELETE')).status,200);
   assert.equal((await call(`/meetings/${m.id}/join`,b.token,'POST',{nickname:'参与者',password:'123456'})).status,403);
-  assert.equal((await call(`/meetings/${m.id}/end`,a.token,'PUT')).status,200);
+  assert.deepEqual((await call(`/meetings/${m.id}/banned`,a.token)).data,[{userId:b.userId,nickname:'参与者'}]);
+  assert.equal((await call(`/meetings/${m.id}/banned`,b.token)).status,403);
+  assert.equal((await call(`/meetings/${m.id}/banned/${b.userId}`,b.token,'DELETE')).status,403);
+  assert.equal((await call(`/meetings/${m.id}/banned/${b.userId}`,a.token,'DELETE')).status,200);
+  const bRejoin=await call(`/meetings/${m.id}/join`,b.token,'POST',{nickname:'参与者',password:'123456'});
+  assert.equal(bRejoin.status,200);
+  assert.deepEqual((await call(`/meetings/${m.id}/banned`,a.token)).data,[]);
+  await assert.rejects(connect(jb.token));
+  sb=await connect(bRejoin.data.token);
+  const transferredState=nextSignal(sa,'room_state');
+  assert.equal((await call(`/meetings/${m.id}/host`,a.token,'PUT',{userId:b.userId})).status,200);
+  const transferred=await transferredState;
+  assert.equal(transferred.meeting.hostId,b.userId);
+  assert.equal(transferred.participants.find(p=>p.userId===b.userId).isHost,true);
+  assert.equal((await call(`/meetings/${m.id}/lock`,a.token,'PUT',{locked:true})).status,403);
+  assert.equal((await call(`/meetings/${m.id}/lock`,b.token,'PUT',{locked:true})).status,200);
+  assert.equal((await call(`/meetings/${m.id}/end`,a.token,'PUT')).status,403);
+  assert.equal((await call(`/meetings/${m.id}/end`,b.token,'PUT')).status,200);
   assert.equal((await call(`/meetings/${m.id}/join`,a.token,'POST',{nickname:'主持人'})).status,409);
   assert.equal((await call(`/meetings/${m.id}`,c.token)).data.participantCount,0);
- } finally { sockets.forEach(s=>s.disconnect()); await server.close(); await rm(dir,{recursive:true,force:true}); if(oldAdminPhone===undefined)delete process.env.ADMIN_PHONE;else process.env.ADMIN_PHONE=oldAdminPhone; if(oldAdminPassword===undefined)delete process.env.ADMIN_PASSWORD;else process.env.ADMIN_PASSWORD=oldAdminPassword; if(oldAnnouncedIp===undefined)delete process.env.RTC_ANNOUNCED_IP;else process.env.RTC_ANNOUNCED_IP=oldAnnouncedIp; }
+ } finally { sockets.forEach(s=>s.disconnect()); await server.close(); await rm(dir,{recursive:true,force:true}); if(previousDbFile===undefined)delete process.env.DB_FILE;else process.env.DB_FILE=previousDbFile; if(oldAdminPhone===undefined)delete process.env.ADMIN_PHONE;else process.env.ADMIN_PHONE=oldAdminPhone; if(oldAdminPassword===undefined)delete process.env.ADMIN_PASSWORD;else process.env.ADMIN_PASSWORD=oldAdminPassword; if(oldAnnouncedIp===undefined)delete process.env.RTC_ANNOUNCED_IP;else process.env.RTC_ANNOUNCED_IP=oldAnnouncedIp; for(const key of turnEnvKeys){if(oldTurnEnv[key]===undefined)delete process.env[key];else process.env[key]=oldTurnEnv[key];} }
+});
+
+test('TURN_ENABLED=false omits TURN while retaining STUN in the join response', async () => {
+ const dir=await mkdtemp(join(tmpdir(),'shunhui-turn-disabled-'));
+ const keys=['DB_FILE','TURN_ENABLED','TURN_TTL_SECONDS','TURN_URLS','TURN_TCP_URL','TURN_SECRET','STUN_URLS','ICE_SERVERS'];
+ const previous=Object.fromEntries(keys.map(key=>[key,process.env[key]]));
+ process.env.DB_FILE=join(dir,'db.sqlite'); process.env.TURN_ENABLED='false';
+ process.env.TURN_TTL_SECONDS='3600'; process.env.TURN_URLS='turn:turn.example.com:3478?transport=udp';
+ process.env.TURN_TCP_URL='turn:turn.example.com:3478?transport=tcp'; process.env.TURN_SECRET='test-turn-secret-with-at-least-32-characters';
+ process.env.STUN_URLS='stun:stun.example.com:3478';
+ process.env.ICE_SERVERS=JSON.stringify([
+  {urls:'turn:static.example.com:3478',username:'static-user',credential:'static-password'},
+  {urls:'stun:custom.example.com:3478'},
+ ]);
+ const fakeSfu={request:async()=>({}),leave:async()=>{},pause:async()=>{},resume:async()=>{},close:()=>{}};
+ let server;
+ try {
+  server=await startServer(0,{sfu:fakeSfu});
+  const base=`http://127.0.0.1:${server.port}`;
+  const call=async(path,token,method='GET',body)=>{
+   const response=await fetch(base+'/api'+path,{method,headers:{'Content-Type':'application/json',Authorization:`Bearer ${token||''}`},body:body===undefined?undefined:JSON.stringify(body)});
+   return {status:response.status,...await response.json()};
+  };
+  const guest=(await call('/user/guest-login','','POST',{nickname:'turn disabled'})).data;
+  const meeting=(await call('/meetings/create',guest.token,'POST',{title:'TURN disabled'})).data;
+  const joined=(await call(`/meetings/${meeting.id}/join`,guest.token,'POST',{nickname:'turn disabled'})).data;
+  assert.deepEqual(joined.iceServers,[{urls:'stun:custom.example.com:3478'},{urls:'stun:stun.example.com:3478'}]);
+ } finally {
+  await server?.close(); await rm(dir,{recursive:true,force:true});
+  for(const key of keys){if(previous[key]===undefined)delete process.env[key];else process.env[key]=previous[key];}
+ }
+});
+
+test('legacy scheduled meetings retain join access through their planned end', async () => {
+ const dir=await mkdtemp(join(tmpdir(),'shunhui-legacy-meeting-'));
+ const keys=['DB_FILE','JWT_SECRET','TURN_ENABLED','TURN_URLS','TURN_TCP_URL','TURN_SECRET','STUN_URLS','ICE_SERVERS'];
+ const previous=Object.fromEntries(keys.map(key=>[key,process.env[key]]));
+ const dbFile=join(dir,'db.sqlite');
+ process.env.DB_FILE=dbFile; process.env.JWT_SECRET='legacy-meeting-test-secret-with-enough-entropy';
+ process.env.TURN_ENABLED='false'; process.env.TURN_URLS=''; process.env.TURN_TCP_URL=''; process.env.TURN_SECRET='';
+ process.env.STUN_URLS=''; process.env.ICE_SERVERS='[]';
+ const fakeSfu={request:async()=>({}),leave:async()=>{},pause:async()=>{},resume:async()=>{},close:()=>{}};
+ let server;
+ try {
+  server=await startServer(0,{sfu:fakeSfu});
+  const base=`http://127.0.0.1:${server.port}`;
+  const call=async(path,token,method='GET',body)=>{
+   const response=await fetch(base+'/api'+path,{method,headers:{'Content-Type':'application/json',Authorization:`Bearer ${token||''}`},body:body===undefined?undefined:JSON.stringify(body)});
+   return {status:response.status,...await response.json()};
+  };
+  const host=(await call('/user/guest-login','','POST',{nickname:'预约主持人'})).data;
+  const guest=(await call('/user/guest-login','','POST',{nickname:'预约参会人'})).data;
+  const startTime=new Date(Date.now()+45*86400000).toISOString();
+  const meeting=(await call('/meetings/schedule',host.token,'POST',{title:'旧数据兼容',startTime,duration:60,inviteDays:1})).data;
+  await server.close(); server=null;
+
+  const legacyDb=new DatabaseSync(dbFile);
+  const row=legacyDb.prepare('SELECT data FROM meetings WHERE id=?').get(meeting.id);
+  const legacyMeeting=JSON.parse(row.data);
+  delete legacyMeeting.banned;
+  legacyMeeting.inviteExpiresAt=new Date(Date.now()+86400000).toISOString();
+  legacyDb.prepare('UPDATE meetings SET data=? WHERE id=?').run(JSON.stringify(legacyMeeting),meeting.id);
+  legacyDb.close();
+
+  server=await startServer(0,{sfu:fakeSfu});
+  const restartedBase=`http://127.0.0.1:${server.port}`;
+  const restored=await fetch(`${restartedBase}/api/meetings/${meeting.id}`,{headers:{Authorization:`Bearer ${guest.token}`}}).then(response=>response.json());
+  assert.ok(Date.parse(restored.data.inviteExpiresAt)>=Date.parse(startTime)+60*60000);
+  const joined=await fetch(`${restartedBase}/api/meetings/${meeting.id}/join`,{method:'POST',headers:{'Content-Type':'application/json',Authorization:`Bearer ${guest.token}`},body:JSON.stringify({nickname:'预约参会人'})});
+  assert.equal(joined.status,200);
+ } finally {
+  await server?.close(); await rm(dir,{recursive:true,force:true});
+  for(const key of keys){if(previous[key]===undefined)delete process.env[key];else process.env[key]=previous[key];}
+ }
 });

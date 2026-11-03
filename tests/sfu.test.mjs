@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createSfu } from '../server/sfu.mjs';
+import { MAX_PARTICIPANTS, MAX_ROOM_MEDIA_STREAMS } from '../shared/meeting-limits.js';
 
 test('real SFU screen publish, subscribe, resume and repeated close', { skip: process.env.REAL_SFU !== '1' }, async () => {
   const events = [];
@@ -61,32 +62,52 @@ test('real SFU screen publish, subscribe, resume and repeated close', { skip: pr
 
 test('enforces the room media stream cap and frees capacity on producer close', { skip: process.env.REAL_SFU !== '1' }, async () => {
   const previousCap = process.env.ROOM_MAX_MEDIA_STREAMS;
-  process.env.ROOM_MAX_MEDIA_STREAMS = '1';
+  process.env.ROOM_MAX_MEDIA_STREAMS = String(MAX_ROOM_MEDIA_STREAMS);
   const sfu = await createSfu(() => {});
   const request = (user, method, data) => sfu.request('capacity-test', user, method, data);
   try {
-    const send = await request('one', 'createTransport', { direction: 'send' });
-    const secondSend = await request('two', 'createTransport', { direction: 'send' });
-    const audio = await request('one', 'produce', {
-      transportId: send.id, kind: 'audio', source: 'audio',
+    const participants = await Promise.all(Array.from({ length: MAX_PARTICIPANTS }, async (_, index) => {
+      const user = `user-${index + 1}`;
+      const transport = await request(user, 'createTransport', { direction: 'send' });
+      return { user, transportId: transport.id, index };
+    }));
+    const media = participants.flatMap(({ user, transportId, index }) => [
+      { user, transportId, source: 'audio', kind: 'audio', ssrc: 500000 + index * 3 },
+      { user, transportId, source: 'video', kind: 'video', ssrc: 500001 + index * 3 },
+      { user, transportId, source: 'screen', kind: 'video', ssrc: 500002 + index * 3 },
+    ]);
+    const published = await Promise.all(media.map(({ user, transportId, source, kind, ssrc }) => request(user, 'produce', {
+      transportId, kind, source,
       rtpParameters: {
-        codecs: [{ mimeType: 'audio/opus', payloadType: 100, clockRate: 48000, channels: 2, parameters: { useinbandfec: 1 }, rtcpFeedback: [] }],
-        encodings: [{ ssrc: 444001 }], rtcp: { cname: 'capacity-test' },
+        codecs: kind === 'audio'
+          ? [{ mimeType: 'audio/opus', payloadType: 100, clockRate: 48000, channels: 2, parameters: { useinbandfec: 1 }, rtcpFeedback: [] }]
+          : [{ mimeType: 'video/VP8', payloadType: 96, clockRate: 90000, rtcpFeedback: [{ type: 'nack' }, { type: 'nack', parameter: 'pli' }] }],
+        encodings: [{ ssrc }], rtcp: { cname: `capacity-${ssrc}` },
       },
-    });
+    })));
+    assert.equal(published.length, MAX_ROOM_MEDIA_STREAMS);
+
+    const overflowUser = 'user-overflow';
+    const overflowTransport = await request(overflowUser, 'createTransport', { direction: 'send' });
     await assert.rejects(
-      request('two', 'produce', { transportId: secondSend.id, kind: 'audio', source: 'audio', rtpParameters: {} }),
+      request(overflowUser, 'produce', {
+        transportId: overflowTransport.id, kind: 'audio', source: 'audio',
+        rtpParameters: {
+          codecs: [{ mimeType: 'audio/opus', payloadType: 100, clockRate: 48000, channels: 2, parameters: { useinbandfec: 1 }, rtcpFeedback: [] }],
+          encodings: [{ ssrc: 600001 }], rtcp: { cname: 'capacity-overflow' },
+        },
+      }),
       /媒体流上限/,
     );
-    await request('one', 'closeProducer', { producerId: audio.id });
-    const second = await request('two', 'produce', {
-      transportId: secondSend.id, kind: 'audio', source: 'audio',
+    await request(participants[0].user, 'closeProducer', { producerId: published[0].id });
+    const replacement = await request(overflowUser, 'produce', {
+      transportId: overflowTransport.id, kind: 'audio', source: 'audio',
       rtpParameters: {
         codecs: [{ mimeType: 'audio/opus', payloadType: 100, clockRate: 48000, channels: 2, parameters: { useinbandfec: 1 }, rtcpFeedback: [] }],
-        encodings: [{ ssrc: 444002 }], rtcp: { cname: 'capacity-test-2' },
+        encodings: [{ ssrc: 600002 }], rtcp: { cname: 'capacity-replacement' },
       },
     });
-    assert.ok(second.id);
+    assert.ok(replacement.id);
   } finally {
     sfu.close();
     if (previousCap === undefined) delete process.env.ROOM_MAX_MEDIA_STREAMS;

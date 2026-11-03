@@ -2,7 +2,7 @@
 import { ref, watch, onMounted, onBeforeUnmount } from 'vue'
 import { logger } from '../services/logger'
 const emit = defineEmits<{ blocked: [value: boolean] }>()
-const props = defineProps<{ stream?: MediaStream | null; muted?: boolean; hidden?: boolean; name?: string; speaker?: string; zoom?: number }>()
+const props = defineProps<{ stream?: MediaStream | null; muted?: boolean; hidden?: boolean; name?: string; speaker?: string; zoom?: number; panX?: number; panY?: number }>()
 const video = ref<HTMLVideoElement>()
 const blocked = ref(false)
 async function sync() {
@@ -28,4 +28,4 @@ onBeforeUnmount(() => {
 })
 defineExpose({ play: sync })
 </script>
-<template><video ref="video" autoplay playsinline :muted="muted" :style="{ opacity: hidden ? 0 : 1, transform: zoom && zoom !== 1 ? `scale(${zoom})` : undefined }"></video><button v-if="blocked" class="media-play" @click="sync">点击播放音视频</button><div v-if="hidden || !stream" class="tile-avatar avatar-blue">{{ name?.slice(0, 1) }}</div></template>
+<template><video ref="video" autoplay playsinline :muted="muted" :style="{ opacity: hidden ? 0 : 1, transform: zoom && (zoom !== 1 || panX || panY) ? `translate3d(${panX || 0}px, ${panY || 0}px, 0) scale(${zoom})` : undefined }"></video><button v-if="blocked" class="media-play" @click="sync">点击播放音视频</button><div v-if="hidden || !stream" class="tile-avatar avatar-blue">{{ name?.slice(0, 1) }}</div></template>

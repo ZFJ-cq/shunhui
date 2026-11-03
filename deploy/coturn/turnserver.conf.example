@@ -1,0 +1,27 @@
+# Copy to turnserver.conf and replace the example values. The shared secret
+# must be identical to TURN_SECRET in the API environment.
+listening-port=3478
+listening-ip=0.0.0.0
+external-ip=203.0.113.10
+
+# Relay allocation ports. Open this UDP range in the host firewall and map it
+# to the same ports when running Coturn in a container.
+min-port=49160
+max-port=49200
+
+# Coturn REST / long-term authentication. The application creates usernames as
+# <unix-expiry>:<random-id> and passwords as base64(HMAC-SHA1(secret, username)).
+realm=meet.example.com
+lt-cred-mech
+use-auth-secret
+static-auth-secret=replace-with-the-same-48-byte-random-secret-as-TURN_SECRET
+fingerprint
+
+# This sample provides UDP and TCP listeners on 3478. TLS/DTLS can be enabled
+# separately if the deployment publishes certificates and a secure TURN port.
+no-tls
+no-dtls
+no-cli
+no-multicast-peers
+no-loopback-peers
+denied-peer-ip=169.254.0.0-169.254.255.255

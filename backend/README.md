@@ -13,6 +13,8 @@ npm run dev
 
 服务默认监听 `http://localhost:3001`。需先创建 MySQL 数据库账户；`.env` 中的 JWT 密钥须为至少 32 个字符。使用 LiveKit 时填写 `LIVEKIT_URL`、`LIVEKIT_API_KEY` 和 `LIVEKIT_API_SECRET`。未配置时，加入会议仍返回 `sfuUrl: ""`；真实媒体连接不可用。启用 LiveKit 后，客户端应通过受鉴权的后端凭证接口取得 LiveKit access token。账号登录只接受已有账号，管理员使用 `npm run user:create -- <phone> <password> <nickname> [avatarUrl]` 建立账号；密码以随机盐 scrypt 哈希保存。
 
+Coturn 使用 REST long-term authentication：设置 `TURN_ENABLED=true`、`TURN_URLS`（逗号分隔的 UDP/TURN URL）、可选的 `TURN_TCP_URL` 和至少 32 个字符的 `TURN_SECRET`。API 与 coturn 的 `static-auth-secret` 必须完全一致。默认用户名有效 24 小时，可用 `TURN_TTL_SECONDS` 改为 60 秒至 7 天；开发环境可设 `TURN_ENABLED=false`。Coturn 服务端配置参考 [turnserver.conf.example](../deploy/coturn/turnserver.conf.example)。
+
 ## REST 契约
 
 成功与失败都使用 `{ "code": number, "msg": string, "data": any }`，成功 `code=0`。业务接口 JWT 从 `Authorization: Bearer <token>` 读取。`hostId` 和 `userId` 入参会与 JWT 主体核对，绝不以请求中的 ID 授权。时间戳 `startTime` 按 Unix 毫秒读取，数据库按 UTC 保存。
@@ -24,7 +26,7 @@ npm run dev
 | POST | `/api/meetings/create` | `{title,hostId,meetingPassword,maxParticipants,defaultMute}` | `{meetingId,joinUrl,token,meetingInfo}` |
 | POST | `/api/meetings/schedule` | `{title,startTime,duration,meetingPassword,maxParticipants,openWaitingRoom,joinBeforeHost,defaultMute}` | 同创建会议 |
 | GET | `/api/meetings/:meetingId` | - | `{meetingId,title,meetingPassword:"",maxParticipants,meetingStatus,defaultMute}` |
-| POST | `/api/meetings/:meetingId/join` | `{nickname,password,userId}` | `{meetingToken,wsSignalingUrl,sfuUrl,meetingInfo,participantInfo}` |
+| POST | `/api/meetings/:meetingId/join` | `{nickname,password,userId}` | `{meetingToken,wsSignalingUrl,sfuUrl,meetingInfo,participantInfo,iceServers}` |
 | POST | `/api/meetings/:meetingId/leave` | `{userId}` | `null` |
 | PUT | `/api/meetings/:meetingId/end` | `{hostId}` | `null` |
 | GET | `/api/meetings/:meetingId/participants` | - | 参会人数组 |
@@ -52,6 +54,8 @@ npm run dev
 ## 信令
 
 原生 WebSocket 地址由加入响应返回：`/ws/signaling/{meetingId}?token={meetingToken}`。每条消息使用 `{type,from,target,payload}`；服务端以 JWT 覆盖 `from`，客户端伪造身份会被拒绝。SDP、ICE 支持 `target` 为数字用户 ID 单播或 `all` 会议内广播。状态/主持人指令只发给同一会议。信令事件包括协议中列出的 `offer`、`answer`、`ice_candidate`、参会人状态、踢人、全员静音、锁定、聊天控制和布局切换。
+
+加入响应中的 `iceServers` 可包含 STUN 与短期 coturn 凭证。用户名格式为 `<过期Unix时间戳>:<随机ID>`，密码是 `base64(HMAC-SHA1(TURN_SECRET, username))`。客户端连通后可发送 `ice_report`，例如 `{type:"ice_report",target:"all",payload:{event:"turn_relay",direction:"send",transportId:"...",localCandidateType:"relay"}}`；事件只记入服务端日志，不向房间广播。TURN 仅转发客户端与 SFU 间的 ICE 媒体路径，SFU 不向 TURN 推流。
 
 同一服务也提供 Socket.IO (`path: /socket.io`)。握手参数使用 `auth: {token, meetingId}` 或 query `token`、`meetingId`；客户端通过 `message` 事件发送相同信封，并监听 `message` 接收。协议地址中的 `{meetingId}` 是必需路径段；Socket.IO 握手单独携带 `meetingId`。WebSocket 使用 URL token 是协议要求；生产环境须强制 HTTPS/WSS，因为 URL 可能进入代理访问日志。
 

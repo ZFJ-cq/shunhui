@@ -10,7 +10,8 @@ export function getLocalStream() {
   return localStream
 }
 
-export function stopLocalStream() {
+export function stopLocalStream(expected?: MediaStream | null) {
+  if (expected !== undefined && localStream !== expected) return
   logger.info('正在停止本地媒体流')
   localStream?.getTracks().forEach((track) => track.stop())
   localStream = null

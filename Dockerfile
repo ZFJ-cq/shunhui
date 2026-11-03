@@ -13,6 +13,7 @@ COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/package.json ./package.json
 COPY --from=build /app/dist ./dist
 COPY server ./server
+COPY shared ./shared
 RUN mkdir -p /app/data && chown -R node:node /app
 USER node
 EXPOSE 33101/tcp 3002/tcp 40000-40100/udp 40000-40100/tcp

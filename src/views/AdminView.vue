@@ -33,12 +33,12 @@ async function createUser() {
 }
 async function disable(user: AdminUser) {
  const action = user.disabled ? '启用' : '禁用'
- try { await ElMessageBox.confirm(`确定${action}账号“${user.nickname}”吗？${user.disabled ? '' : '禁用后，该账号将无法继续使用会议服务。'}`, `${action}账号`, { confirmButtonText: `确认${action}`, cancelButtonText: '返回', type: 'warning' }) } catch { return }
+ try { await ElMessageBox.confirm(`确定${action}账号“${user.nickname}”吗？${user.disabled ? '' : '禁用后，该账号将无法继续使用会议服务。'}`, `${action}账号`, { confirmButtonText: `确认${action}`, cancelButtonText: '返回', type: 'warning', confirmButtonClass: user.disabled ? '' : 'danger-confirm-button' }) } catch { return }
  const ok = await attempt(async () => { await api(`/admin/users/${user.id}`, 'PUT', { disabled: !user.disabled }); return true })
  if (ok) { ElMessage.success(`账号已${action}。`); await refresh() }
 }
 async function end(meeting: AdminMeeting) {
- try { await ElMessageBox.confirm(`结束“${meeting.title}”后，所有参会人都会立即离开。`, '结束会议', { confirmButtonText: '结束会议', cancelButtonText: '继续会议', type: 'warning' }) } catch { return }
+ try { await ElMessageBox.confirm(`结束“${meeting.title}”后，所有参会人都会立即离开。`, '结束会议', { confirmButtonText: '结束会议', cancelButtonText: '继续会议', type: 'warning', confirmButtonClass: 'danger-confirm-button' }) } catch { return }
  const ok = await attempt(async () => { await api(`/admin/meetings/${meeting.id}/end`, 'PUT'); return true })
  if (ok) { ElMessage.success('会议已结束。'); await refresh() }
 }

@@ -1,10 +1,14 @@
 import * as mediasoup from 'mediasoup';
+import { MAX_ROOM_MEDIA_STREAMS } from '../shared/meeting-limits.js';
 
-export async function createSfu(notify) {
-  const maxRoomStreams = Number(process.env.ROOM_MAX_MEDIA_STREAMS || 25);
+export async function createSfu(notify, { mediasoupImpl = mediasoup } = {}) {
+  const maxRoomStreams = Number(process.env.ROOM_MAX_MEDIA_STREAMS || MAX_ROOM_MEDIA_STREAMS);
+  if (!Number.isSafeInteger(maxRoomStreams) || maxRoomStreams < MAX_ROOM_MEDIA_STREAMS) {
+    throw Error(`ROOM_MAX_MEDIA_STREAMS must be an integer of at least ${MAX_ROOM_MEDIA_STREAMS}`);
+  }
   const maxIncomingBitrate = Number(process.env.PEER_MAX_INCOMING_BITRATE || 6000000);
   const maxOutgoingBitrate = Number(process.env.PEER_MAX_OUTGOING_BITRATE || 8000000);
-  const worker = await mediasoup.createWorker({ rtcMinPort: Number(process.env.RTC_MIN_PORT || 40000), rtcMaxPort: Number(process.env.RTC_MAX_PORT || 40100), logLevel: process.env.MEDIASOUP_LOG_LEVEL || 'warn' });
+  const worker = await mediasoupImpl.createWorker({ rtcMinPort: Number(process.env.RTC_MIN_PORT || 40000), rtcMaxPort: Number(process.env.RTC_MAX_PORT || 40100), logLevel: process.env.MEDIASOUP_LOG_LEVEL || 'warn' });
   worker.on('died', () => { console.error('SFU worker died'); process.exit(1); });
   const rooms = new Map();
   async function room(id) {
@@ -60,9 +64,15 @@ export async function createSfu(notify) {
       if (!['audio', 'video', 'screen'].includes(data.source) || peer.producers.size >= 3 || (data.source !== 'screen' && [...peer.producers.values()].some(p => p.appData.source === data.source))) throw Error('无效媒体源');
       if ((data.source === 'audio' && data.kind !== 'audio') || (data.source !== 'audio' && data.kind !== 'video')) throw Error('媒体类型不匹配');
       if (r.streamCount >= maxRoomStreams) throw Error('房间已达到媒体流上限');
-      const producer = await transport.produce({ kind: data.kind, rtpParameters: data.rtpParameters, appData: { userId, source: data.source } });
-      peer.producers.set(producer.id, producer); r.producers.set(producer.id, producer);
       r.streamCount++;
+      let producer;
+      try {
+        producer = await transport.produce({ kind: data.kind, rtpParameters: data.rtpParameters, appData: { userId, source: data.source } });
+      } catch (error) {
+        r.streamCount--;
+        throw error;
+      }
+      peer.producers.set(producer.id, producer); r.producers.set(producer.id, producer);
       producer.on('transportclose', () => removeProducer(r, peer, producer, meetingId));
       if (producer.kind === 'audio') await r.observer.addProducer({ producerId: producer.id });
       notify(meetingId, 'new_producer', { id: producer.id, userId, source: data.source });

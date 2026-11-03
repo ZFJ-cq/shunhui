@@ -19,6 +19,7 @@ export function createRoom() {
   const networkQuality = ref<NetworkQuality>({ rttMs: null, sendLossPercent: null, receiveLossPercent: null, sendKbps: null, receiveKbps: null, weak: false })
   let socket: Socket, device: Device, sendTransport: types.Transport | undefined, recvTransport: types.Transport | undefined
   let options: JoinOptions, stream: MediaStream | null, iceServers: RTCIceServer[] = [], closed = false, generation = 0
+  const reportedIceEvents = new Set<string>()
   const producers = new Map<string, types.Producer>(), consumers = new Map<string, types.Consumer>(), consuming = new Set<string>()
   const pendingProducers = new Map<string, ProducerInfo>(), closedProducers = new Set<string>()
   const consumerLayers = new Map<string, number>()
@@ -27,6 +28,36 @@ export function createRoom() {
   const recoveryTimers = new Set<ReturnType<typeof setInterval>>()
   let pendingRetryTimer: ReturnType<typeof setTimeout> | undefined
   let onControl: (type: string, payload: any) => void = () => {}
+  function reportIceEvent(direction: 'send' | 'recv', transportId: string, event: 'success' | 'stun_ok' | 'turn_relay', localCandidateType?: string, remoteCandidateType?: string) {
+    if (closed || !socket?.connected) return
+    const key = `${transportId}:${event}`
+    if (reportedIceEvents.has(key)) return
+    reportedIceEvents.add(key)
+    socket.emit('request', { type: 'ice_report', payload: { direction, transportId, event, localCandidateType, remoteCandidateType } }, (result: any) => {
+      if (result?.error) logger.warn('ICE 状态埋点上报失败', { event, direction, error: result.error })
+    })
+  }
+  async function reportConnectedIce(t: types.Transport, direction: 'send' | 'recv') {
+    // Report transport success separately from the selected candidate type. TURN
+    // relays the browser-to-SFU ICE path; mediasoup remains the media router.
+    reportIceEvent(direction, t.id, 'success')
+    for (let attempt = 0; attempt < 5 && !closed; attempt++) {
+      try {
+        const stats = Array.from((await t.getStats()).values()) as any[]
+        const transportStats = stats.find(stat => stat.type === 'transport' && stat.selectedCandidatePairId)
+        const pair = stats.find(stat => stat.id === transportStats?.selectedCandidatePairId)
+          || stats.find(stat => stat.type === 'candidate-pair' && (stat.selected || (stat.nominated && stat.state === 'succeeded')))
+        const local = stats.find(stat => stat.id === pair?.localCandidateId)
+        const remote = stats.find(stat => stat.id === pair?.remoteCandidateId)
+        const localCandidateType = local?.candidateType
+        const remoteCandidateType = remote?.candidateType
+        if (localCandidateType === 'relay') reportIceEvent(direction, t.id, 'turn_relay', localCandidateType, remoteCandidateType)
+        else if (localCandidateType === 'srflx') reportIceEvent(direction, t.id, 'stun_ok', localCandidateType, remoteCandidateType)
+        if (localCandidateType) return
+      } catch { /* Stats may be unavailable briefly after ICE connects. */ }
+      if (attempt < 4) await new Promise(resolve => setTimeout(resolve, 300))
+    }
+  }
   // 只记录操作名与耗时；不打印鉴权、聊天正文、SDP/ICE 等原始载荷。
   function request<T = any>(type: string, payload: any = {}): Promise<T> {
     const operation = type === 'sfu' ? `sfu.${payload.method}` : type
@@ -93,7 +124,10 @@ export function createRoom() {
     t.on('connect', ({ dtlsParameters }, done, fail) => { rpc('connectTransport', { transportId: t.id, dtlsParameters }).then(done).catch(fail) })
     if (direction === 'send') t.on('produce', ({ kind, rtpParameters, appData }, done, fail) => { rpc('produce', { transportId: t.id, kind, rtpParameters, source: appData.source }).then(done).catch(fail) })
     logger.info('已创建媒体传输', { direction, transportId: t.id })
-    t.on('connectionstatechange', state => logger.info('媒体传输连接状态', { direction, transportId: t.id, state }))
+    t.on('connectionstatechange', state => {
+      logger.info('媒体传输连接状态', { direction, transportId: t.id, state })
+      if (state === 'connected') void reportConnectedIce(t, direction)
+    })
     t.on('icegatheringstatechange', state => logger.info('ICE 候选收集状态', { direction, transportId: t.id, state }))
     return t
   }
@@ -137,18 +171,39 @@ export function createRoom() {
       let videoRecovery: ReturnType<typeof setInterval> | undefined
       consumerCleanups.set(consumer.id, remove)
       if (consumer.kind === 'video') {
-        let previousBytes = -1, stalledSamples = 0, requesting = false
+        let previousPackets = -1, previousReceivedFrames = -1, previousDecodedFrames = -1, stalledSamples = 0
+        let sampling = false, requesting = false, lastRefreshAt = 0
         videoRecovery = setInterval(async () => {
-          if (closed || current !== generation || consumer.closed || consumer.track.readyState !== 'live' || requesting) return
+          const sourcePaused = info.source === 'video' && participants.value.find(p => p.userId === info.userId)?.videoOff
+          if (closed || current !== generation || consumer.closed || consumer.track.readyState !== 'live' || consumer.paused || sourcePaused || sampling || requesting) {
+            if (sourcePaused) stalledSamples = 0
+            return
+          }
+          sampling = true
           try {
             const stats = await consumer.getStats()
             const inbound = [...stats.values()].find((entry: any) => entry.type === 'inbound-rtp' && entry.kind === 'video') as any
-            if (!inbound || typeof inbound.bytesReceived !== 'number') return
-            const progress = inbound.framesDecoded ?? inbound.framesReceived ?? inbound.bytesReceived
-            if (previousBytes >= 0 && progress === previousBytes) stalledSamples++
-            else stalledSamples = 0
-            previousBytes = progress
+            if (!inbound || typeof inbound.packetsReceived !== 'number') return
+            const packets = inbound.packetsReceived
+            const receivedFrames = typeof inbound.framesReceived === 'number' ? inbound.framesReceived : -1
+            const decodedFrames = typeof inbound.framesDecoded === 'number' ? inbound.framesDecoded : -1
+            const packetsAdvanced = previousPackets >= 0 && packets > previousPackets
+            const receivedFramesAdvanced = previousReceivedFrames >= 0 && receivedFrames >= 0 && receivedFrames > previousReceivedFrames
+            const decodedFramesAdvanced = previousDecodedFrames >= 0 && decodedFrames >= 0 && decodedFrames > previousDecodedFrames
+            // A paused or static screen share may stop producing frames. Diagnose
+            // screen stalls only when new frames arrive but decoding does not;
+            // for cameras, a complete RTP stall is actionable too.
+            const stalled = info.source === 'screen'
+              ? receivedFramesAdvanced && previousDecodedFrames >= 0 && !decodedFramesAdvanced
+              : (previousPackets >= 0 && !packetsAdvanced) || (receivedFramesAdvanced && previousDecodedFrames >= 0 && !decodedFramesAdvanced)
+            stalledSamples = stalled ? stalledSamples + 1 : 0
+            previousPackets = packets
+            if (receivedFrames >= 0) previousReceivedFrames = receivedFrames
+            if (decodedFrames >= 0) previousDecodedFrames = decodedFrames
             if (stalledSamples >= 3) {
+              const now = Date.now()
+              if (now - lastRefreshAt < 30000) return
+              lastRefreshAt = now
               logger.warn('远端视频停滞，正在请求关键帧', { consumerId: consumer.id, source: info.source })
               stalledSamples = 0
               requesting = true
@@ -156,6 +211,7 @@ export function createRoom() {
               requesting = false
             }
           } catch { requesting = false }
+          finally { sampling = false }
         }, 4000)
         recoveryTimers.add(videoRecovery)
       }

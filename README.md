@@ -2,6 +2,18 @@
 
 Vue 3 + TypeScript 前端、Express/Socket.IO 服务、mediasoup SFU、SQLite 或 MySQL 持久化。房间状态由服务端持有，媒体由 SFU 转发；客户端不能自行声明主持人身份。账号密码使用 scrypt，会议密码使用带盐 scrypt，均不采用 PRD 中不适合存密码的 MD5。
 
+## 目录结构
+
+- `src/`：Vue 页面、组件、状态和浏览器媒体/信令客户端。
+- `server/`：根目录应用的 Express API、Socket.IO 信令、mediasoup SFU 和独立 SFU 进程入口。
+- `shared/`：主应用与独立后端共用的 TURN 临时凭据工具。
+- `backend/`：另一套独立部署的 Node.js + MySQL + WebSocket/Socket.IO + LiveKit 后端，有自己的依赖、配置和测试；根目录的 `npm run dev`、`npm test` 和 Docker Compose 不会启动它。
+- `deploy/`：Docker Compose、Nginx、环境变量样例和 coturn 配置参考。
+- `docs/`：当前信令、架构、验收和实现状态文档；一期交付资料集中在 `docs/delivery-v1/`。项目 PRD 保留在仓库根目录。
+- `tests/`、`backend/test/`：分别验证根目录应用和独立后端。
+
+根目录应用是当前配套的完整前后端，生产 Compose 使用 `server/` 和 mediasoup。`backend/` 是另一套尚未与当前 Vue 客户端适配的 LiveKit/MySQL 服务；它的 REST 字段和 Socket.IO 消息事件与根目录客户端不同，按 [backend/README.md](backend/README.md) 单独启动，并完成客户端协议适配后再联调。
+
 ## 开发
 
 要求 Node.js 22 或 24、Python 3.10+、C++ 构建工具。mediasoup 安装会下载 worker，无法取到预编译包时会本地编译。
@@ -21,10 +33,12 @@ npm run dev
 ## 生产部署
 
 1. 将 `deploy/.env.example` 复制为项目 `.env`，填入数据库、JWT、内部RPC与TURN随机密钥，公网IP、域名与管理员凭证。
-2. 证书保存为 `deploy/certs/fullchain.pem`、`privkey.pem`。设置 `APP_ORIGIN=https://会议域名` 和 `TURN_URLS=turn:会议域名:3478?transport=udp,turn:会议域名:3478?transport=tcp`。
+2. 证书保存为 `deploy/certs/fullchain.pem`、`privkey.pem`。设置 `APP_ORIGIN=https://会议域名`、`TURN_ENABLED=true`、`TURN_URLS=turn:会议域名:3478?transport=udp`、`TURN_TCP_URL=turn:会议域名:3478?transport=tcp`，并用 `openssl rand -hex 32` 为 `TURN_SECRET` 生成随机密钥。Coturn 使用相同的 `static-auth-secret`；配置样例见 [turnserver.conf.example](deploy/coturn/turnserver.conf.example)。
 3. 运行 `docker compose up --build -d`，启动 MySQL、API、signaling TLS/WebSocket网关、SFU、Coturn 五个服务。公网开放 TCP443、UDP/TCP40000–40100、UDP/TCP3478、UDP49160–49200。
 4. API是房间状态权威源，网关仅代理TLS和Socket.IO，SFU用内部认证RPC连接。生产密钥不要沿用示例，数据库密码中的URL保留字符需编码。
-5. 管理员首次启动时由 `ADMIN_PHONE`、`ADMIN_PASSWORD` 创建，之后可通过管理页创建普通账号。Coturn REST凭证按每次入会动态生成，有效期24小时；服务间密钥仅保存在服务器。
+5. 管理员首次启动时由 `ADMIN_PHONE`、`ADMIN_PASSWORD` 创建，之后可通过管理页创建普通账号。Coturn REST凭证按每次入会动态生成，默认有效期24小时，可用 `TURN_TTL_SECONDS` 调整；`TURN_ENABLED=false` 可停止向客户端下发 TURN 配置。服务器只记录 ICE URL、临时用户名和已遮盖的密码字段，不记录可复用凭证。
+
+会议容量固定最多25个在线成员，主持人计入席位。SFU至少预留75条房间发布流，涵盖每位成员的音频、摄像头和屏幕共享；`ROOM_MAX_MEDIA_STREAMS` 不得低于75。Nginx会覆盖转发的客户端IP头，API只信任其前置的一个代理跳数；单机API限流为每IP每分钟600次，游客登录60次，账号登录120次并叠加每账号15分钟10次。多API副本部署前必须配置共享限流存储和共享房间状态锁，当前SQLite/JSON行存储不支持多副本写入。
 
 真实 mediasoup 官方worker已在本机启动并通过transport集成检查。开发环境Docker daemon不可用，未启动Compose；公网TURN、跨浏览器媒体、25人负载和300ms时延目标仍需部署环境验收。本地 TLS 会自动使用 `deploy/certs/lan-cert.pem` 和 `deploy/certs/lan-key.pem`（如果存在），也可通过 `HTTPS_CERT`/`HTTPS_KEY` 指定证书路径。
 
@@ -32,7 +46,7 @@ npm run dev
 
 - 游客身份、预置账号登录、管理员登录；JWT 鉴权与账号禁用。
 - 即时会议、预约会议、会前主持人限制、密码、容量、锁定、取消/结束、我的会议和邀请二维码。
-- Host 授权、在线参会名单、强制静音/关视频请求、移除与防止重入、锁会、关闭聊天。
+- Host 授权、在线参会名单、主持人转让、强制静音/关视频请求、移除与主持人解封后重入、锁会、关闭聊天。
 - Socket.IO 房间信令；mediasoup SFU 音频/视频、屏幕共享、发言人检测；实时公共聊天与历史。
 - 管理页显示用户、会议、参会记录、操作审计、在线数和信令连接数。
 - 本地 SQLite、MySQL 存储、Docker Compose、Nginx HTTPS 反代与 coturn 配置。
@@ -58,6 +72,8 @@ npm run dev
 | GET | `/api/meetings/:id/participants` | 在线参会人 |
 | PUT | `/api/meetings/:id/participant/mute` | 主持人静音或请求开麦/关视频 |
 | DELETE | `/api/meetings/:id/participant/:userId` | 移除并禁止重入 |
+| GET | `/api/meetings/:id/banned` | 主持人查看封禁名单 |
+| DELETE | `/api/meetings/:id/banned/:userId` | 主持人解除入会限制 |
 | PUT | `/api/meetings/:id/lock` | 锁定/解锁 |
 | PUT | `/api/meetings/:id/chat` | 关闭/开放聊天 |
 | GET/POST | `/api/meetings/:id/chat`、`/chat/send` | 历史/发消息 |
@@ -70,7 +86,7 @@ npm run dev
 
 Socket.IO 默认同源 `/socket.io`。连接认证使用 `auth.token` 的短期 meeting JWT，服务端从 token 派生用户、房间与主持人权限。信令 envelope 为 `{type,from,target,payload}`，`request` 使用 ack 回答；事件包括 `room_state`、`participant_left`、`chat_message`、`active_speaker`、`new_producer`、`producer_closed`、`consumer_closed`、`meeting_ended`、`kicked`、`host_media` 和 `switch_layout`。mediasoup 的 ICE/DTLS/RTP 参数通过 `sfu` request 方法交换，这替代浏览器点对点 SDP offer/answer。
 
-客户端每 4 秒采集发送/接收 WebRTC RTT、上下行丢包率和码率，并在会中显示网络质量；弱网时限制摄像头 simulcast 层，恢复后提升层数，统计不受支持时继续使用浏览器原生拥塞控制。媒体 transport 建立或运行失败时，客户端清理旧 transport 并自动短重试一次；Socket.IO 信令断线最多自动重连 8 次，重连成功后沿用原会议凭证同步状态、重建媒体 transport 并重新订阅远端流，屏幕共享因浏览器安全限制需要重新选择。屏幕共享优先保留 1080p 细节，主舞台完整显示共享内容，参会者缩略视图可滚动；服务端为摄像头、共享和音频预留合计码率空间。公网 TURN 和端到端流畅度仍须按实际网络环境验收。存储目前用 JSON 列存每行，适用于小规模 MVP，不支持多 API 副本并发写；上线扩容前应迁移到规范化表和集中式房间状态/锁。
+客户端每 4 秒采集发送/接收 WebRTC RTT、上下行丢包率和码率，并在会中显示网络质量；ICE 建连后还会上报 `success`，并依据选中的本地 candidate 上报 `stun_ok` 或 `turn_relay`。TURN 只在客户端到 SFU 的 ICE 路径上提供中继，mediasoup 仍负责媒体路由，媒体流不会由 SFU 推送到 TURN。弱网时限制摄像头 simulcast 层，恢复后提升层数，统计不受支持时继续使用浏览器原生拥塞控制。媒体 transport 建立或运行失败时，客户端清理旧 transport 并自动短重试一次；Socket.IO 信令断线最多自动重连 8 次，重连成功后沿用原会议凭证同步状态、重建媒体 transport 并重新订阅远端流，屏幕共享因浏览器安全限制需要重新选择。屏幕共享优先保留 1080p 细节，主舞台完整显示共享内容，参会者缩略视图可滚动；服务端为摄像头、共享和音频预留合计码率空间。公网 TURN 和端到端流畅度仍须按实际网络环境验收。存储目前用 JSON 列存每行，适用于小规模 MVP，不支持多 API 副本并发写；上线扩容前应迁移到规范化表和集中式房间状态/锁。
 
 ## 检查
 
@@ -82,7 +98,7 @@ REAL_SFU=1 npm test
 npm run build
 ```
 
-集成测试以注入式 SFU 替身检查服务端授权、容量、控制、聊天与 Socket.IO；它不替代真实浏览器音视频验收。
+集成测试以注入式 SFU 替身检查服务端授权、25人并发入会、75条并发发布容量、控制、聊天与 Socket.IO；它不替代真实浏览器音视频验收。25人同时发布音频、摄像头和共享的设备验收步骤见 [MVP 验收用例](docs/acceptance.md)。
 
 ## 前端代码与信令示例
 

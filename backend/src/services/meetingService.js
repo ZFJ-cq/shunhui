@@ -4,6 +4,23 @@ import { config } from '../config.js'
 import * as repo from '../repositories/meetings.js'
 import { HttpError } from '../errors.js'
 import { hashPassword, verifyPassword } from './passwords.js'
+import { createTurnCredential } from '../../../shared/turn-credential.js'
+import { log } from '../logger.js'
+
+function iceServers(meetingId, userId) {
+  const servers = config.stunUrls.map(urls => ({ urls }))
+  let expiresAt
+  if (config.turn.enabled) {
+    const turn = createTurnCredential({ secret: config.turn.secret, ttlSeconds: config.turn.ttlSeconds })
+    const urls = config.turn.urls.length === 1 ? config.turn.urls[0] : config.turn.urls
+    servers.push({ urls, username: turn.username, credential: turn.credential })
+    expiresAt = turn.expiresAt
+  }
+  // Log the ICE configuration for diagnosis without writing a usable password.
+  const safeServers = servers.map(server => ({ ...server, ...(server.credential ? { credential: '[REDACTED]' } : {}) }))
+  log('info', 'ICE configuration issued', { meetingId, userId, iceServers: safeServers, ...(expiresAt ? { turnExpiresAt: new Date(expiresAt * 1000).toISOString() } : {}) })
+  return servers
+}
 
 export function signMeetingToken(id, user, role) {
   return jwt.sign({ nickname: user.nickname, meetingId: id, role }, config.jwtSecret, {
@@ -32,7 +49,7 @@ export async function join(id, user, password) {
   const meetingToken = signMeetingToken(id, user, result.role)
   return { meetingToken, wsSignalingUrl: `${config.wsPublicUrl}/ws/signaling/${id}?token=${encodeURIComponent(meetingToken)}`,
     sfuUrl: config.livekit.url || '', meetingInfo: await repo.getMeetingDetails(id),
-    participantInfo: { userId: user.id, nickname: user.nickname, isHost: result.role === 'host' } }
+    participantInfo: { userId: user.id, nickname: user.nickname, isHost: result.role === 'host' }, iceServers: iceServers(id, user.id) }
 }
 
 export async function requireHost(id, userId) {

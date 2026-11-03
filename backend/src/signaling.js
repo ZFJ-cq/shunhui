@@ -40,6 +40,20 @@ async function handleMessage(s, message) {
   let output
   if (hostCommands.has(type)) await requireHost(s.meetingId, s.user.id)
   switch (type) {
+    case 'ice_report': {
+      const events = new Set(['success', 'stun_ok', 'turn_relay'])
+      const candidateTypes = new Set(['host', 'srflx', 'prflx', 'relay', 'unknown'])
+      const { event, direction, transportId, localCandidateType, remoteCandidateType } = payload
+      if (!events.has(event)) throw new Error('无效ICE状态事件')
+      if (!['send', 'recv'].includes(direction)) throw new Error('无效ICE传输方向')
+      if (typeof transportId !== 'string' || !transportId.length || transportId.length > 128) throw new Error('无效ICE传输ID')
+      if (localCandidateType !== undefined && !candidateTypes.has(localCandidateType)) throw new Error('无效本地ICE候选类型')
+      if (remoteCandidateType !== undefined && !candidateTypes.has(remoteCandidateType)) throw new Error('无效远端ICE候选类型')
+      if (event === 'stun_ok' && localCandidateType !== 'srflx') throw new Error('stun_ok需要srflx候选')
+      if (event === 'turn_relay' && localCandidateType !== 'relay') throw new Error('turn_relay需要relay候选')
+      log('info', 'ICE telemetry', { meetingId: s.meetingId, userId: s.user.id, event, direction, transportId, localCandidateType: localCandidateType || null, remoteCandidateType: remoteCandidateType || null })
+      return // Telemetry is logged for this participant only, never broadcast.
+    }
     case 'offer': case 'answer':
       output = { sdp: text(payload.sdp, 'sdp', 100000) }; break
     case 'ice_candidate':

@@ -16,7 +16,7 @@ export default createRouter({
     { path: '/my-meetings', component: MyMeetingsView },
     { path: '/precheck', component: PrecheckView },
     {
-      path: '/meeting/:meetingId', component: () => import('./views/MeetingView.vue'),
+      path: '/meeting/:meetingId', name: 'meeting', component: () => import('./views/MeetingView.vue'),
       beforeEnter: (to) => {
         if (useMeetingStore().pendingJoin.meetingId !== String(to.params.meetingId)) {
           return { path: '/', query: { meeting: String(to.params.meetingId) } }
